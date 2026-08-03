@@ -2,236 +2,188 @@
 
 set -euo pipefail
 
+
 ACCESSION="$1"
 OUTDIR="$2"
 
 mkdir -p "$OUTDIR"
 
-PREFIX="${ACCESSION:0:6}nnn"
 
-USER_AGENT="GEO-Downloader/1.0"
+########################################
+# GEO series prefix
+########################################
+
+PREFIX=$(echo "$ACCESSION" | sed -E 's/^(GSE[0-9]{3}).*/\1nnn/')
+
+USER_AGENT="Mozilla/5.0 (GEO downloader)"
+
+
+########################################
+# Validate file types
+########################################
 
 VALID_REGEX='\.(tar|tar\.gz|gz|csv|csv\.gz|rds|rds\.gz|h5ad|h5ad\.gz|txt|txt\.gz)$'
+
 
 declare -A FILES=()
 
 
 ########################################
-# Normalize FTP URLs to HTTPS
-########################################
-
-normalize_url() {
-
-    local url="$1"
-
-    if [[ "$url" == ftp://ftp.ncbi.nlm.nih.gov* ]]; then
-        url="${url/ftp:\/\//https:\/\/}"
-    fi
-
-    echo "$url"
-}
-
-
-########################################
-# Add unique downloadable file
-########################################
-
-add_file() {
-
-    local url="$1"
-
-    url=$(normalize_url "$url")
-
-    local filename
-    filename=$(basename "$url")
-
-    [[ -z "$filename" ]] && return
-
-
-    if [[ "$filename" =~ $VALID_REGEX ]]; then
-
-        if [[ "$url" =~ (biorxiv|doi.org|pubmed) ]]; then
-            return
-        fi
-
-        FILES["$filename"]="$url"
-
-    fi
-}
-
-
-########################################
-# 1. GEO accession page extraction
-########################################
-
-echo "Extracting GEO links..."
-
-ACC_URL="https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=${ACCESSION}"
-
-
-while read -r link; do
-
-    add_file "$link"
-
-done < <(
-
-    curl \
-        -s \
-        -H "User-Agent: ${USER_AGENT}" \
-        "$ACC_URL" \
-    | grep -oE 'href="[^"]+"' \
-    | sed 's/href="//;s/"//'
-
-)
-
-
-########################################
-# 2. GEO supplementary directory
+# Supplementary directory
 ########################################
 
 SUPPL_URL="https://ftp.ncbi.nlm.nih.gov/geo/series/${PREFIX}/${ACCESSION}/suppl/"
 
-echo "Checking supplement directory:"
-echo "$SUPPL_URL"
 
+echo
+echo "Checking:"
+echo "$SUPPL_URL"
+echo
+
+
+########################################
+# Find files
+########################################
 
 while read -r filename; do
 
-    add_file "${SUPPL_URL}${filename}"
+    if [[ "$filename" =~ $VALID_REGEX ]]; then
+
+        FILES["$filename"]="${SUPPL_URL}${filename}"
+
+    fi
 
 done < <(
 
     curl \
+        --fail \
         -s \
-        -H "User-Agent: ${USER_AGENT}" \
+        -A "$USER_AGENT" \
         "$SUPPL_URL" \
-    | grep -oE '[A-Za-z0-9._-]+\.(tar|tar.gz|gz|csv|csv.gz|rds|rds.gz|h5ad|h5ad.gz|txt|txt.gz)' \
-    | sort -u
+    |
+    grep -oE '[A-Za-z0-9._-]+\.(tar|tar.gz|gz|csv|csv.gz|rds|rds.gz|h5ad|h5ad.gz|txt|txt.gz)' \
+    |
+    sort -u
 
 )
 
 
-########################################
-# 3. GEO text listing fallback
-########################################
-
-TEXT_URL="https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=${ACCESSION}&targ=self&view=full&form=text"
-
-
-while read -r link; do
-
-    add_file "$link"
-
-done < <(
-
-    curl \
-        -s \
-        -H "User-Agent: ${USER_AGENT}" \
-        "$TEXT_URL" \
-    | grep "$ACCESSION" \
-    | grep -oE '[^[:space:]]+\.(tar|tar.gz|gz|csv|csv.gz|rds|rds.gz|h5ad|h5ad.gz|txt|txt.gz)' \
-    || true
-
-)
-
 
 ########################################
-# Summary
+# Check results
 ########################################
 
-echo
-echo "Found ${#FILES[@]} unique downloadable files"
-echo
+
+echo "Found ${#FILES[@]} files"
 
 
 if [[ ${#FILES[@]} -eq 0 ]]; then
 
-    echo "ERROR: No downloadable files found"
+    echo "ERROR: No supplementary files found"
     exit 1
 
 fi
 
 
-INDEX=1
+echo
 
-for filename in "${!FILES[@]}"; do
-
-    echo "  [$INDEX] $filename"
-    INDEX=$((INDEX+1))
-
+for f in "${!FILES[@]}"; do
+    echo "$f"
 done
-
 
 echo
 
 
-########################################
-# Download files
-########################################
 
-TOTAL=${#FILES[@]}
-COUNT=0
+########################################
+# Download
+########################################
 
 
 for filename in "${!FILES[@]}"; do
 
-    COUNT=$((COUNT+1))
 
     URL="${FILES[$filename]}"
     OUTPUT="${OUTDIR}/${filename}"
 
 
-    echo "========================================"
-    echo "[$COUNT/$TOTAL] Downloading:"
+    echo "================================="
+    echo "Downloading:"
     echo "$filename"
     echo "$URL"
-    echo "========================================"
+    echo "================================="
 
 
-    if [[ -f "$OUTPUT" ]]; then
-        echo "Existing file found, resuming if incomplete..."
-    fi
+    rm -f "${OUTPUT}.tmp"
 
 
     curl \
+        --fail \
         -L \
         --http1.1 \
-        -H "User-Agent: ${USER_AGENT}" \
-        -H "Accept: */*" \
+        -A "$USER_AGENT" \
         --retry 5 \
         --retry-delay 5 \
-        --continue-at - \
-        -o "$OUTPUT" \
+        -o "${OUTPUT}.tmp" \
         "$URL"
 
 
-    echo
-    echo "✓ Finished: $filename"
-
 
     ####################################
-    # SHA256 checksum
+    # Check not HTML/XML error page
     ####################################
 
-    if command -v sha256sum >/dev/null 2>&1; then
 
-        SHA=$(sha256sum "$OUTPUT" | awk '{print $1}')
+    FILETYPE=$(file "${OUTPUT}.tmp")
 
-    else
 
-        SHA=$(shasum -a 256 "$OUTPUT" | awk '{print $1}')
+    if echo "$FILETYPE" | grep -qiE "HTML|XML|ASCII"; then
+
+        echo
+        echo "ERROR: Downloaded file is not data:"
+        echo "$FILETYPE"
+        echo
+
+        head "${OUTPUT}.tmp"
+
+        rm "${OUTPUT}.tmp"
+
+        exit 1
 
     fi
 
 
-    echo "SHA256: $SHA"
+
+    mv "${OUTPUT}.tmp" "$OUTPUT"
+
+
+
+    ####################################
+    # Validate gzip
+    ####################################
+
+
+    if [[ "$OUTPUT" == *.gz ]]; then
+
+        echo "Checking gzip integrity..."
+
+        gzip -t "$OUTPUT"
+
+    fi
+
+
+
+    echo "✓ Completed: $filename"
     echo
+
 
 done
 
 
-echo "========================================"
+
+echo
+echo "================================="
 echo "DOWNLOAD COMPLETE"
-echo "Files saved to:"
+echo "Saved to:"
 echo "$OUTDIR"
-echo "========================================"
+echo "================================="
